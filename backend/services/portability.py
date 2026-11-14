@@ -535,6 +535,7 @@ def inspect_bundle(source: BundleSource, *, verify_blobs: bool = True) -> dict:
             # ``money_io._statement_row``'s own id gate; this is the earlier, clearer refusal.
             if name in portable_bridge.MONEY_FILES:
                 errors.extend(money_io.validate_money_file_shape(name, parsed))
+            errors.extend(portable_bridge.artifact_metadata_errors(name, parsed))
             errors.extend(portable_bridge.attachment_id_errors(name, parsed))
 
             files.append(

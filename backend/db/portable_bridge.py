@@ -394,6 +394,11 @@ from backend.db import (
     profile_io,
     wave5c_io,
 )
+from backend.db.artifact_store import (
+    artifact_filename,
+    canonical_artifact_file_path,
+    is_artifact_id,
+)
 from backend.db.attachment_store import is_attachment_id
 from backend.db.owned_assets_legacy import normalize_imported_asset
 from backend.db.tables import (
@@ -621,17 +626,68 @@ def _config_bridge(table: Table, *, book_id: str | None = None) -> Bridge:
 
 
 def _misc_bridge(table: Table, *, id_field: str = "id") -> Bridge:
-    """The three bridged misc stores (``artifacts``/``uploads`` — HYBRID, metadata only;
-    ``email_snapshots`` — FULL MIGRATE, ``id_field="message_id"``) share ``misc_io``'s
-    generic (seq, id, payload) import/export pair, parameterized by ``table`` +
-    ``id_field`` — mirrors ``_logs_bridge`` exactly (no ``book_id`` anywhere in this wave).
-    ``pending_pushes`` (the fourth misc store) is NOT built through this helper — it is
-    wipe-only (module docstring, PLAN 4E TASK 1 section)."""
+    """Build the unvalidated (seq, id, payload) bridge shared by simple misc stores.
+
+    Artifacts and attachments wrap this same ``misc_io`` storage shape with their own import
+    validators because their ids or metadata select files. ``pending_pushes`` remains wipe-only.
+    """
     return Bridge(
         export_fn=lambda conn: misc_io.export_payload_list(conn, table),
         import_fn=lambda conn, raw: misc_io.import_payload_list(
             conn, table, raw, id_field=id_field
         ),
+    )
+
+
+def artifact_metadata_errors(filename: str, parsed: object) -> list[str]:
+    """Artifact metadata a restore must refuse before any row can select a file."""
+    if filename != "artifacts.json":
+        return []
+    if not isinstance(parsed, list):
+        return [f"{filename}: expected a list of artifact objects"]
+
+    errors = []
+    for i, row in enumerate(parsed):
+        where = f"{filename}[{i}]"
+        if not isinstance(row, dict):
+            errors.append(f"{where}: expected an artifact object")
+            continue
+        artifact_id = row.get("id")
+        artifact_type = row.get("artifact_type")
+        if not is_artifact_id(artifact_id):
+            errors.append(f"{where}.id: {artifact_id!r} is not an artifact id")
+        name = artifact_filename(artifact_id, artifact_type)
+        if name is None and is_artifact_id(artifact_id):
+            errors.append(f"{where}.artifact_type: {artifact_type!r} is not an artifact type")
+            continue
+        if name is None:
+            continue
+        current = canonical_artifact_file_path(artifact_id, artifact_type)
+        legacy = f"artifacts/{name}"
+        if row.get("file_path") not in (current, legacy):
+            errors.append(
+                f"{where}.file_path: {row.get('file_path')!r} is not the artifact's canonical path"
+            )
+    return errors
+
+
+def _artifacts_bridge() -> Bridge:
+    def _canonicalize(row: dict) -> dict:
+        file_path = canonical_artifact_file_path(row.get("id"), row.get("artifact_type"))
+        return {**row, "file_path": file_path} if file_path is not None else row
+
+    def _import(conn: Connection, raw: list[dict]) -> int:
+        errors = artifact_metadata_errors("artifacts.json", raw)
+        if errors:
+            raise ValidationError("; ".join(errors[:5]))
+        canonical = [_canonicalize(row) for row in raw]
+        return misc_io.import_payload_list(conn, artifacts, canonical)
+
+    return Bridge(
+        export_fn=lambda conn: [
+            _canonicalize(row) for row in misc_io.export_payload_list(conn, artifacts)
+        ],
+        import_fn=_import,
     )
 
 
@@ -855,19 +911,20 @@ BRIDGED: dict[str, Bridge] = {
     # core.portable.PORTABLE_FILES) before this task touched anything. UNDOABLE
     # (misc_io.import_payload_list fires fire_db_write_hook unconditionally, like every
     # other bridged store) and NO cross-file FK, so all three ride the GENERIC per-file
-    # services.portability._apply_bridged_import loop. The fourth (pending_pushes) is
-    # wipe-only — see _WIPE_FNS below; no BRIDGED entry for it.
+    # services.portability._apply_bridged_import loop. Artifacts and attachments add their own
+    # metadata validators inside that loop. The fourth (pending_pushes) is wipe-only — see
+    # _WIPE_FNS below; no BRIDGED entry for it.
     #
     # "uploads.json" -> "attachments.json" (cross-channel-attachments RFC Phase 2,
     # revision 0041 / ADR 2026-08-16-attachment-store-replaces-upload-store): the bundle
     # KEY changes with the table rename. No dual-key import shim (CLAUDE.md: no
     # backward-compat shims) — a portable export produced before this change would not
     # restore its uploads.json member after this change; acceptable for pre-1.0 data.
-    "artifacts.json": _misc_bridge(artifacts),
+    "artifacts.json": _artifacts_bridge(),
     "attachments.json": _attachments_bridge(),
     # Transaction receipts (cross-channel-attachments RFC Phase 4, revision 0042) — the
-    # SAME bare (seq, id, payload) shape as artifacts/attachments above, so they ride the
-    # identical generic `_misc_bridge`/`misc_io` pair with zero bespoke plumbing. Receipt
+    # SAME bare (seq, id, payload) shape as artifacts/attachments above, so they use the
+    # generic `_misc_bridge`/`misc_io` pair without those stores' metadata validators. Receipt
     # BLOB bytes (RECEIPTS_DIR) are not touched here either, mirroring artifacts'/
     # attachments' own "reset's file-level wipe owns the directory" split.
     "receipts.json": _misc_bridge(receipts),

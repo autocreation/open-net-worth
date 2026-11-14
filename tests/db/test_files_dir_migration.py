@@ -289,7 +289,7 @@ def test_migration_rewrites_statement_and_artifact_file_paths(
     statement_bytes = b"%PDF-1.4 fake bank statement"
     (old_statements_dir / f"{statement_id}.pdf").write_bytes(statement_bytes)
 
-    artifact_id = "art_test000001"
+    artifact_id = "art_0123456789ab"
     artifact_html = "<!doctype html><html><body>chart</body></html>"
     (old_artifacts_dir / f"{artifact_id}.html").write_text(artifact_html)
 
