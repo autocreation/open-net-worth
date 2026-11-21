@@ -48,14 +48,14 @@ WIPE_ONLY_MISC_FILES = ("pending_pushes.json",)
 
 ARTIFACTS = [
     {
-        "id": "art_1",
+        "id": "art_0123456789ab",
         "created_at": "2026-08-01T09:00:00Z",
         "session_id": "sess_1",
         "title": "May 2026 spending",
         "filename": "may_2026.html",
         "artifact_type": "html",
         "size_bytes": 1234,
-        "file_path": "artifacts/art_1.html",
+        "file_path": "files/artifacts/art_0123456789ab.html",
     }
 ]
 
@@ -188,6 +188,21 @@ def test_export_bundle_contains_the_three_live_misc_files_db_sourced(db_isolated
         assert json.loads(zf.read("email_snapshots.json")) == EMAIL_SNAPSHOTS
 
 
+def test_artifact_export_reconstructs_portable_path_from_valid_identity(db_isolated):
+    windows_row = [
+        {
+            **ARTIFACTS[0],
+            "file_path": "files\\artifacts\\art_0123456789ab.html",
+        }
+    ]
+    with get_engine().begin() as conn:
+        mio.import_payload_list(conn, artifacts, windows_row)
+    with get_engine().connect() as conn:
+        exported = portable_bridge.BRIDGED["artifacts.json"].export_fn(conn)
+
+    assert exported == ARTIFACTS
+
+
 # ── Import: representative bundle, old-bundle restore, absent-resets-to-empty ─────────
 
 
@@ -212,9 +227,10 @@ def test_misc_bundle_round_trips_through_bridge(db_isolated):
 def test_import_synthetic_old_bundle_lands_rows(db_isolated):
     """A hand-built bundle stands in for one exported BEFORE these stores were
     migrated — old and new bundles are handled identically, by filename alone."""
+    legacy_artifacts = [{**ARTIFACTS[0], "file_path": "artifacts/art_0123456789ab.html"}]
     bundle = _build_bundle(
         {
-            "artifacts.json": json.dumps(ARTIFACTS, ensure_ascii=False).encode(),
+            "artifacts.json": json.dumps(legacy_artifacts, ensure_ascii=False).encode(),
             "email_snapshots.json": json.dumps(EMAIL_SNAPSHOTS, ensure_ascii=False).encode(),
         }
     )
@@ -232,13 +248,49 @@ def test_reimport_replaces_existing_misc_data_entirely(db_isolated):
     with get_engine().begin() as conn:
         mio.import_payload_list(conn, artifacts, ARTIFACTS)
 
-    new_artifacts = [{**ARTIFACTS[0], "id": "art_2", "title": "replaced"}]
+    new_artifacts = [
+        {
+            **ARTIFACTS[0],
+            "id": "art_abcdef012345",
+            "title": "replaced",
+            "file_path": "files/artifacts/art_abcdef012345.html",
+        }
+    ]
     bundle = _build_bundle({"artifacts.json": json.dumps(new_artifacts).encode()})
     result = svc.apply_import(bundle)
 
     assert result["row_counts"]["artifacts.json"] == len(new_artifacts)
     with get_engine().connect() as conn:
         assert mio.export_payload_list(conn, artifacts) == new_artifacts
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"id": "../../auth"},
+        {"id": "art_1"},
+        {"artifact_type": "text"},
+        {"artifact_type": []},
+        {"file_path": "/etc/passwd"},
+        {"file_path": "../auth.json"},
+        {"file_path": "files/secrets/auth.json"},
+        {"file_path": "files\\artifacts\\art_0123456789ab.html"},
+    ],
+)
+def test_artifact_import_refuses_unsafe_metadata_at_both_boundaries(db_isolated, changes):
+    from backend.core.errors import ValidationError
+
+    rows = [{**ARTIFACTS[0], **changes}]
+    bundle = _build_bundle({"artifacts.json": json.dumps(rows).encode()})
+
+    report = svc.inspect_bundle(bundle)
+    assert report["ok"] is False
+    assert any("artifact" in error for error in report["errors"])
+    with get_engine().begin() as conn:
+        with pytest.raises(ValidationError, match="artifact"):
+            portable_bridge.BRIDGED["artifacts.json"].import_fn(conn, rows)
+    with get_engine().connect() as conn:
+        assert mio.export_payload_list(conn, artifacts) == []
 
 
 def test_import_absent_misc_file_wipes_that_store_to_empty(db_isolated):
