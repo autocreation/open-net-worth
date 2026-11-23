@@ -53,6 +53,41 @@ def test_read_text_round_trip_and_missing(store):
     assert store.read_text("nope") is None
 
 
+@pytest.mark.parametrize("path_kind", ["absolute", "traversal", "sibling"])
+def test_read_bytes_never_uses_stored_file_path(store, tmp_path, path_kind):
+    if path_kind == "traversal":
+        outside = tmp_path.parent / f"{tmp_path.name}-auth.json"
+        file_path = f"../{outside.name}"
+    else:
+        outside = tmp_path / f"{path_kind}-auth.json"
+        file_path = str(outside) if path_kind == "absolute" else outside.name
+    outside.write_bytes(b"secret")
+    artifact_id = "art_0123456789ab"
+    store.insert(
+        {
+            "id": artifact_id,
+            "artifact_type": "html",
+            "file_path": file_path,
+        }
+    )
+
+    assert store.read_bytes(artifact_id) is None
+
+
+def test_read_bytes_refuses_a_symlink_target(store, tmp_path):
+    rec = store.create("t", "t.html", "html", HTML, session_id=None)
+    disk = tmp_path / rec["file_path"]
+    outside = tmp_path / "outside.html"
+    outside.write_text("secret")
+    disk.unlink()
+    try:
+        disk.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+
+    assert store.read_bytes(rec["id"]) is None
+
+
 def test_list_for_session_filters(store):
     store.create("a", "a.html", "html", HTML, session_id="s1")
     store.create("b", "b.html", "html", HTML, session_id="s2")
